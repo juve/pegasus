@@ -1,0 +1,390 @@
+#!/usr/bin/env python
+import os
+import sys
+import shlex
+import subprocess
+from optparse import OptionParser
+
+def gettemp():
+    tempdir = os.getenv("TMPDIR", "/tmp")
+
+class RescueLogException(Exception): pass
+
+class RescueLog(object):
+    def __init__(self, path):
+        self.path = path
+        self.fd = None
+        self.finished = set()
+
+        if os.path.isfile(self.path):
+            self._parse()
+
+        self.open()
+
+    def _parse(self):
+        for l in open(self.path, "r"):
+            l = l.strip()
+
+            if len(l) == 0 or l.startswith("#"):
+                continue
+
+            rec = shlex.split(l)
+
+            if len(rec) != 2:
+                raise RescueLogException("Invalid rescue log record: %s" % l)
+
+            name = rec[1]
+
+            self.finished.add(name)
+
+    def open(self):
+        if self.fd is not None:
+            self.close()
+
+        self.fd = open(self.path, "a")
+
+    def close(self):
+        if self.fd is None:
+            return
+
+        self.fd.close()
+        self.fd = None
+
+    def __del__(self):
+        self.close()
+
+    def is_finished(self, task):
+        if isinstance(task, Task):
+            return task.name in self.finished
+        else:
+            return task in self.finished
+
+    def mark_finished(self, task):
+        if self.fd is None:
+            raise RescueLogException("Rescue log not open")
+
+        if isinstance(task, Task):
+            name = task.name
+        else:
+            name = task
+
+        if name in self.finished:
+            return
+
+        self.fd.write("DONE %s\n" % name)
+        self.fd.flush()
+
+        self.finished.add(name)
+
+class TaskState(object):
+    UNREADY = "UNREADY"
+    READY = "READY"
+    RUNNING = "RUNNING"
+    FAILED = "FAILED"
+    SUCCESSFUL = "SUCCESSFUL"
+
+class Task(object):
+    def __init__(self, name):
+        self.name = name
+        self.state = TaskState.UNREADY
+        self.command = []
+        self.processes = 1
+        self.priority = 0
+        self.runtime = 0
+
+        self.parents = []
+        self.children = []
+
+class DAGException(Exception): pass
+
+class DAG(object):
+    def __init__(self, path):
+        self.path = path
+        self.rescue = RescueLog(self.path + ".rescue")
+
+        self.tasks = {}
+        self.ready = set()
+        self.running = set()
+
+        # Parse the DAG file
+        self._parse()
+
+        # Set the initial state of the DAG
+        for t in self.tasks.values():
+            if rescue.is_finished(t):
+                # If it was in the rescue file, then mark it successful
+                t.state = TaskState.SUCCESSFUL
+
+        # Mark all the ready tasks
+        for t in self.tasks.values():
+            if self.is_ready(t):
+                self.mark_ready(t)
+
+    def _parse(self):
+        for l in open(self.path, "r"):
+            l = l.strip()
+            if len(l) == 0 or l.startswith('#'):
+                continue
+
+            if l.startswith("TASK"):
+                cmd = shlex.split(l)
+
+                # Ignore the first token
+                cmd.pop(0)
+
+                # Second token is task name
+                name = cmd.pop(0)
+
+                task = Task(name)
+
+                def intorerror(task, arg, value):
+                    try:
+                        return int(value)
+                    except Exception, e:
+                        raise DAGException("Invalid value for %s argument of task %s" % (arg, task))
+
+                # Following tokens starting with - are task arguments
+                while len(cmd) > 0 and cmd[0][0] == '-':
+                    arg = cmd.pop(0)
+
+                    if len(cmd) == 0:
+                        raise DAGException("Missing value for %s argument of task %s" % (arg, name))
+
+                    value = cmd.pop(0)
+
+                    if arg == "-p" or arg == "--processes":
+                        task.processes = intorerror(name, arg, value)
+                        if task.processes <= 0:
+                            raise DAGException("Invalid processes for task %s: %s" % (name, value))
+                    elif arg == "-P" or arg == "--priority":
+                        task.priority = intorerror(name, arg, value)
+                    elif arg == "-r" or arg == "--runtime":
+                        task.runtime = intorerror(name, arg, value)
+                        if task.runtime <= 0:
+                            raise DAGException("Invalid runtime for task %s: %s" % (name, value))
+                    else:
+                        raise DAGException("Invalid task argument for task '%s': %s" % (name, arg))
+
+                # Everything else is the command
+                task.command = cmd
+
+                if len(task.command) == 0:
+                    raise DAGException("Empty command for task %s" % name)
+
+                self.tasks[name] = task
+            elif l.startswith("EDGE"):
+                rec = shlex.split(l)
+
+                if len(rec) != 3:
+                    raise DAGException("Invalid EDGE record: %s" % l)
+
+                parent = rec[1]
+                child = rec[2]
+
+                if parent not in self.tasks:
+                    raise DAGException("No such task: %s" % parent)
+
+                if child not in self.tasks:
+                    raise DAGException("No such task: %s" % child)
+
+                p = self.tasks[parent]
+                c = self.tasks[child]
+
+                p.children.append(c)
+                c.parents.append(p)
+            else:
+                raise DAGException("Invalid record in DAG: %s" % l)
+
+    def is_ready(self, t):
+        # If its current state is not unready, then it can't be ready
+        if t.state != TaskState.UNREADY:
+            return False
+
+        # In order to be ready, all its parents have to be successful
+        for p in t.parents:
+            if p.state != TaskState.SUCCESSFUL:
+                return False
+
+        return True
+
+    def mark_ready(self, t):
+        # Skipt tasks that are already ready
+        if t in self.ready:
+            return
+
+        t.state = TaskState.READY
+        self.ready.add(t)
+
+    def mark_running(self, t):
+        self.ready.remove(t)
+        t.state = TaskState.RUNNING
+        self.running.add(t)
+
+    def mark_successful(self, t):
+        self.running.remove(t)
+
+        t.state = TaskState.SUCCESSFUL
+
+        self.rescue.mark_finished(t)
+
+        # Mark ready children
+        for c in t.children:
+            if self.is_ready(c):
+                self.mark_ready(c)
+
+    def mark_failed(self, t):
+        # TODO Consider retries
+        self.running.remove(t)
+
+        t.state = TaskState.FAILED
+
+    def is_finished(self):
+        # The workflow is finished when it has no running or ready tasks
+        return len(self.ready) == 0 and len(self.running) == 0
+
+class NodeList(object):
+    def __init__(self, nodefile):
+        self.nodefile = nodefile
+
+        self.nodes = {}
+        self.read_nodefile()
+
+    def read_nodefile(self):
+        for node in open(self.nodefile, "r"):
+            node = node.strip()
+
+            if len(node) == 0:
+                continue
+
+            if node in self.nodes:
+                self.nodes[node] += 1
+            else:
+                self.nodes[node] = 1
+
+    def allocate_nodes(self, task):
+        pass
+
+    def release_nodes(self, task):
+        pass
+
+    def __str__(self):
+        return str(self.nodes)
+
+def compare_tasks(t1, t2):
+    # Sort by priority (higher first), then by job size (larger jobs first)
+    if t1.priority == t2.priority:
+        return(t2.processes * t2.runtime) - (t1.processes * t1.runtime)
+    return t2.priority - t1.priority
+
+class Scheduler(object):
+    def __init__(self, dag, manager, nodes):
+        self.dag = dag
+        self.manager = manager
+        self.nodes = nodes
+
+    def run(self):
+        while not self.dag.is_finished():
+
+            # Get list of ready tasks
+            tasks = list(self.dag.ready)
+
+            # Sort tasks by priority
+            tasks.sort(compare_tasks)
+
+            for t in tasks:
+                # If next ready task fits on available nodes:
+                t.allocation = self.nodes.allocate_nodes(t)
+                if t.allocation:
+                    # Schedule that task on those nodes
+                    self.manager.launch_task(t)
+                    self.dag.mark_running(t)
+                else:
+                    break
+
+            # Wait for a task to finish
+            t, status = self.manager.wait()
+
+            # Mark nodes as idle
+            self.nodes.release_nodes(t.allocation)
+
+            # If task was successful:
+            if status == 0:
+                self.dag.mark_successful(t)
+            else:
+                self.dag.mark_failed(t)
+
+class ProcessManager(object):
+
+    def __init__(self):
+        self.processes = {}
+
+    def launch_command(self, task, command):
+        # TODO Set up stdout and stderr
+
+        #p = subprocess.Popen(command)
+
+        # TODO Save process in map
+        pass
+
+    def wait(self):
+        # TODO Wait for a process to finish
+        # TODO Look up the associated task
+        # TODO Write stdio
+        # TODO Log cluster-task
+        return task, status
+
+class APRUN(ProcessManager):
+
+    def launch_task(self, task, allocation):
+        # aprun -l node1,node2 -N ppn -n processes ...
+        pass
+
+class MPIEXEC(ProcessManager):
+
+    def launch_task(self, task, allocation):
+        # TODO Create nodefile for job
+
+        # TODO Generate command to run
+        # mpiexec -f nodefile -n processes ...
+
+        #self.launch_command(task, command)
+        pass
+
+def main():
+    parser = OptionParser("%prog [options] DAGFILE")
+    parser.add_option("-m", action="store", dest="manager",
+                      default=os.getenv("PHC_MANAGER", "mpiexec"),
+                      help="MPI process manager ('mpiexec' or 'aprun', default '%default')")
+    options, args = parser.parse_args()
+
+    if options.manager == 'mpiexec':
+        manager = MPIEXEC()
+    elif options.manager == 'aprun':
+        manager = APRUN()
+    else:
+        parser.error("Invalid manager: %s" % options.manager)
+
+    if len(args) != 1:
+        parser.error("Specify DAGFILE")
+
+    dagfile = args[0]
+
+    if not os.path.isfile(dagfile):
+        parser.error("Invalid DAGFILE")
+
+    dag = DAG(dagfile)
+
+    nodefile = os.getenv("PBS_NODEFILE")
+    if nodefile is None:
+        parser.error("PBS_NODEFILE not set in environment")
+
+    nodes = NodeList(nodefile)
+
+    scheduler = Scheduler(dag, manager, nodes)
+    scheduler.run()
+
+    rescue.close()
+
+if __name__ == '__main__':
+    main()
+
